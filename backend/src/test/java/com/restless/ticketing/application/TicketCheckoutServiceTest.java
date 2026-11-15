@@ -51,6 +51,7 @@ import org.junit.jupiter.api.*;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
@@ -486,11 +487,7 @@ class TicketCheckoutServiceTest {
                             paymentService.onApprovalStarting(reservation.reservationId(), attempt)));
                     await(reachedWaitPoint);
                     // DB 시각이 실제 기한에 도달한 뒤 잠금을 풀어 두 경계의 동작 차이를 검증한다.
-                    long waitLimit = System.nanoTime() + TimeUnit.SECONDS.toNanos(8);
-                    while (databaseNow().isBefore(deadline) && System.nanoTime() < waitLimit) {
-                        TimeUnit.MILLISECONDS.sleep(10);
-                    }
-                    assertThat(databaseNow()).isAfterOrEqualTo(deadline);
+                    awaitDatabaseDeadline(deadline);
                     assertThat(future.isDone()).isFalse();
                 } finally {
                     transactionManager.rollback(blocker);
@@ -542,6 +539,10 @@ class TicketCheckoutServiceTest {
                     .isInstanceOf(IllegalTransactionStateException.class);
             assertThatThrownBy(() -> paymentService.onApproved(1L,
                     new ApprovedPayment(9001L, "ticket-9001", "key-9001", 200000, databaseNow(), databaseNow())))
+                    .isInstanceOf(IllegalTransactionStateException.class);
+            assertThatThrownBy(() -> paymentService.onFailed(1L, PaymentAttemptContext.notStarted(9001L)))
+                    .isInstanceOf(IllegalTransactionStateException.class);
+            assertThatThrownBy(() -> paymentService.onUnknown(1L, new PaymentAttemptContext(9001L, databaseNow())))
                     .isInstanceOf(IllegalTransactionStateException.class);
         }
 
@@ -711,20 +712,6 @@ class TicketCheckoutServiceTest {
             assertConfirmed(accepted, 2);
         }
 
-        private AcceptedReservation acceptStart() {
-            var reservation = reserve();
-            var prepared = checkout(reservation);
-            var attempt = new PaymentAttemptContext(9001L, databaseNow());
-            assertThat(paymentTransaction(() -> paymentService.onApprovalStarting(reservation.reservationId(), attempt)))
-                    .isEqualTo(ApprovalDecision.accept());
-            return new AcceptedReservation(reservation, prepared, attempt);
-        }
-
-        private ApprovedPayment approved(AcceptedReservation accepted) {
-            return new ApprovedPayment(accepted.attempt().paymentId(), "ticket-9001", "key-9001",
-                    accepted.checkout().totalAmount(), accepted.attempt().approvalStartedAt(), databaseNow());
-        }
-
         private List<Ticket> issued(AcceptedReservation accepted) {
             return tickets.findAllByReservationIdOrderByPerformanceSeatIdAsc(accepted.reservation().reservationId());
         }
@@ -762,8 +749,334 @@ class TicketCheckoutServiceTest {
             });
         }
 
-        private record AcceptedReservation(TicketReservationInfo reservation, TicketCheckoutInfo checkout,
-                                           PaymentAttemptContext attempt) { }
+    }
+
+    private AcceptedReservation acceptStart() {
+        var reservation = reserve();
+        var prepared = checkout(reservation);
+        var attempt = new PaymentAttemptContext(9001L, databaseNow());
+        assertThat(paymentTransaction(() -> paymentService.onApprovalStarting(reservation.reservationId(), attempt)))
+                .isEqualTo(ApprovalDecision.accept());
+        return new AcceptedReservation(reservation, prepared, attempt);
+    }
+
+    private ApprovedPayment approved(AcceptedReservation accepted) {
+        return new ApprovedPayment(accepted.attempt().paymentId(), "ticket-9001", "key-9001",
+                accepted.checkout().totalAmount(), accepted.attempt().approvalStartedAt(), databaseNow());
+    }
+
+    private record AcceptedReservation(TicketReservationInfo reservation, TicketCheckoutInfo checkout,
+                                       PaymentAttemptContext attempt) { }
+
+    @Nested
+    @DisplayName("결제 실패와 불명확 결과")
+    class ApprovalFailure {
+        @ParameterizedTest(name = "{displayName} [불명확 경유={0}]")
+        @ValueSource(booleans = {false, true})
+        @DisplayName("실패 후 같은 주문·기한으로 재시도하고 과거 결과는 새 시도를 변경하지 않는다")
+        void failureAllowsRetryAndIgnoresStaleResults(boolean unknownFirst) {
+            var accepted = acceptStart();
+            if (unknownFirst) unknown(accepted, accepted.attempt());
+            failed(accepted, accepted.attempt());
+            failed(accepted, accepted.attempt());
+            assertThat(orders.find(accepted.checkout().orderId()).orElseThrow().status()).isEqualTo(OrderStatus.PENDING_PAYMENT);
+            assertThat(pending(accepted)).isFalse();
+            assertHeldSeats(accepted.reservation());
+            var retry = new PaymentAttemptContext(9002L, databaseNow());
+            assertThat(paymentTransaction(() -> paymentService.onApprovalStarting(accepted.reservation().reservationId(), retry)))
+                    .isEqualTo(ApprovalDecision.accept());
+            failed(accepted, accepted.attempt());
+            unknown(accepted, accepted.attempt());
+            failed(accepted, PaymentAttemptContext.notStarted(8999L));
+            unknown(accepted, new PaymentAttemptContext(retry.paymentId(), retry.approvalStartedAt().plusSeconds(1)));
+            assertThat(reservationStatus(accepted.reservation().reservationId())).isEqualTo("PAYMENT_PENDING");
+            assertThat(orders.find(accepted.checkout().orderId()).orElseThrow().status()).isEqualTo(OrderStatus.PAYMENT_CONFIRMING);
+            assertThat(pending(accepted)).isTrue();
+            assertThat(jdbc.queryForObject("SELECT current_payment_id FROM ticket_reservations WHERE id = ?",
+                    Long.class, accepted.reservation().reservationId())).isEqualTo(retry.paymentId());
+            assertThat(checkout(accepted.reservation())).isEqualTo(accepted.checkout());
+            assertHeldSeats(accepted.reservation());
+        }
+
+        @Test
+        @DisplayName("기한 후 불명확과 재통지는 좌석·기한을 보호하고 같은 시도의 성공을 확정한다")
+        void unknownProtectsExpiredAttemptUntilSuccess() {
+            var accepted = expiredAttempt(acceptStart());
+            unknown(accepted, accepted.attempt());
+            unknown(accepted, accepted.attempt());
+            assertThat(reservationStatus(accepted.reservation().reservationId())).isEqualTo("RECONCILING");
+            assertThat(orders.find(accepted.checkout().orderId()).orElseThrow().status()).isEqualTo(OrderStatus.PAYMENT_REVIEW);
+            assertThat(pending(accepted)).isTrue();
+            assertHeldSeats(accepted.reservation());
+            assertThat(instantColumn("payment_expires_at", accepted.reservation().reservationId())).isEqualTo(accepted.checkout().paymentExpiresAt());
+            assertThat(paymentTransaction(() -> paymentService.onApproved(accepted.reservation().reservationId(), approved(accepted))))
+                    .isEqualTo(ApprovalDecision.accept());
+            failed(accepted, accepted.attempt());
+            unknown(accepted, accepted.attempt());
+            assertThat(reservationStatus(accepted.reservation().reservationId())).isEqualTo("CONFIRMED");
+            assertThat(orders.find(accepted.checkout().orderId()).orElseThrow().status()).isEqualTo(OrderStatus.PAID);
+            assertThat(tickets.findAllByReservationIdOrderByPerformanceSeatIdAsc(accepted.reservation().reservationId())).hasSize(2);
+            assertThat(reservedCount()).isZero();
+        }
+
+        @Test
+        @DisplayName("불명확 시도의 기한 후 동시 실패 통지는 전체 좌석·수량을 한 번만 반환한다")
+        void concurrentFailureReleasesOnce() throws Exception {
+            var accepted = expiredAttempt(acceptStart());
+            jdbc.update("UPDATE ticket_purchase_limits SET confirmed_count = 1 WHERE user_id = ? AND performance_id = ?",
+                    fixture.firstUserId(), fixture.performanceId());
+            unknown(accepted, accepted.attempt());
+            try (var pool = Executors.newFixedThreadPool(2)) {
+                var start = new CountDownLatch(1);
+                Callable<Void> action = () -> {
+                    assertThat(start.await(10, TimeUnit.SECONDS)).isTrue();
+                    failed(accepted, accepted.attempt());
+                    return null;
+                };
+                var first = pool.submit(action);
+                var second = pool.submit(action);
+                start.countDown();
+                first.get(15, TimeUnit.SECONDS);
+                second.get(15, TimeUnit.SECONDS);
+            }
+            unknown(accepted, accepted.attempt());
+            assertReleased(accepted.reservation().reservationId(), accepted.checkout().orderId());
+            assertThat(pending(accepted)).isFalse();
+            assertThat(jdbc.queryForObject("SELECT confirmed_count FROM ticket_purchase_limits WHERE user_id = ? AND performance_id = ?",
+                    Integer.class, fixture.firstUserId(), fixture.performanceId())).isEqualTo(1);
+            assertThat(instantColumn("approval_started_at", accepted.reservation().reservationId())).isEqualTo(accepted.attempt().approvalStartedAt());
+        }
+
+        @Test
+        @DisplayName("승인 미시도 READY 실패는 기한 전 유지하고 기한 후 반환하되 시도 기록을 만들지 않는다")
+        void readyExpiryWithoutAcceptedAttempt() {
+            var reservation = reserve();
+            var prepared = checkout(reservation);
+            var attempt = PaymentAttemptContext.notStarted(9001L);
+            paymentTransaction(() -> { paymentService.onFailed(reservation.reservationId(), attempt); return null; });
+            assertHeldSeats(reservation);
+            assertThat(orders.find(prepared.orderId()).orElseThrow().status()).isEqualTo(OrderStatus.PENDING_PAYMENT);
+            jdbc.update("UPDATE ticket_reservations SET checkout_started_at = DATE_SUB(checkout_started_at, INTERVAL 10 MINUTE), payment_expires_at = DATE_SUB(payment_expires_at, INTERVAL 10 MINUTE) WHERE id = ?", reservation.reservationId());
+            paymentTransaction(() -> { paymentService.onFailed(reservation.reservationId(), attempt); return null; });
+            assertReleased(reservation.reservationId(), prepared.orderId());
+            assertThat(jdbc.queryForObject("SELECT current_payment_id FROM ticket_reservations WHERE id = ?", Long.class, reservation.reservationId())).isNull();
+        }
+
+        @ParameterizedTest(name = "{displayName} [실패 통지={0}]")
+        @ValueSource(booleans = {true, false})
+        @DisplayName("결과 반영 flush 후 호출자 실패는 주문·예약·좌석·수량을 모두 롤백한다")
+        void callbackRollback(boolean failure) {
+            var accepted = expiredAttempt(acceptStart());
+            assertThatThrownBy(() -> paymentTransaction(() -> {
+                if (failure) paymentService.onFailed(accepted.reservation().reservationId(), accepted.attempt());
+                else paymentService.onUnknown(accepted.reservation().reservationId(), accepted.attempt());
+                entityManager.flush();
+                assertThat(reservationStatus(accepted.reservation().reservationId())).isEqualTo(failure ? "RELEASED" : "RECONCILING");
+                throw new InjectedFailure();
+            })).isInstanceOf(InjectedFailure.class);
+            assertThat(reservationStatus(accepted.reservation().reservationId())).isEqualTo("PAYMENT_PENDING");
+            assertThat(orders.find(accepted.checkout().orderId()).orElseThrow().status()).isEqualTo(OrderStatus.PAYMENT_CONFIRMING);
+            assertThat(pending(accepted)).isTrue();
+            assertHeldSeats(accepted.reservation());
+            failed(accepted, accepted.attempt());
+            assertReleased(accepted.reservation().reservationId(), accepted.checkout().orderId());
+        }
+
+        @Test
+        @DisplayName("두 번째 좌석 소유권 불일치면 첫 좌석도 반환하지 않고 실패 반영을 롤백한다")
+        void failureDoesNotOverwriteLostOwnership() {
+            var accepted = expiredAttempt(acceptStart());
+            jdbc.update("UPDATE performance_seats SET status = 'AVAILABLE', current_hold_id = NULL WHERE id = ?", accepted.reservation().seatIds().get(1));
+            assertThatThrownBy(() -> failed(accepted, accepted.attempt())).isInstanceOf(IllegalStateException.class);
+            assertThat(reservationStatus(accepted.reservation().reservationId())).isEqualTo("PAYMENT_PENDING");
+            assertThat(pending(accepted)).isTrue();
+            assertThat(reservedCount()).isEqualTo(2);
+            assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM seat_holds WHERE reservation_id = ? AND status = 'HELD'", Integer.class, accepted.reservation().reservationId())).isEqualTo(2);
+            assertThat(jdbc.queryForObject("SELECT status FROM performance_seats WHERE id = ?", String.class, accepted.reservation().seatIds().get(0))).isEqualTo("HELD");
+            assertThat(orders.find(accepted.checkout().orderId()).orElseThrow().status()).isEqualTo(OrderStatus.PAYMENT_CONFIRMING);
+        }
+
+        private void failed(AcceptedReservation accepted, PaymentAttemptContext attempt) {
+            paymentTransaction(() -> { paymentService.onFailed(accepted.reservation().reservationId(), attempt); return null; });
+        }
+
+        private void unknown(AcceptedReservation accepted, PaymentAttemptContext attempt) {
+            paymentTransaction(() -> { paymentService.onUnknown(accepted.reservation().reservationId(), attempt); return null; });
+        }
+
+        private boolean pending(AcceptedReservation accepted) {
+            return jdbc.queryForObject("SELECT payment_result_pending FROM ticket_reservations WHERE id = ?", Boolean.class, accepted.reservation().reservationId());
+        }
+
+        private void assertReleased(Long reservationId, Long orderId) {
+            assertThat(reservationStatus(reservationId)).isEqualTo("RELEASED");
+            assertThat(orders.find(orderId).orElseThrow().status()).isEqualTo(OrderStatus.CANCELLED);
+            assertThat(reservedCount()).isZero();
+            assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM seat_holds WHERE reservation_id = ? AND status = 'RELEASED' AND released_at IS NOT NULL", Integer.class, reservationId)).isEqualTo(2);
+            assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM performance_seats WHERE id IN (?, ?) AND status = 'AVAILABLE' AND current_hold_id IS NULL", Integer.class, fixture.seatIds().get(0), fixture.seatIds().get(1))).isEqualTo(2);
+            assertThat(tickets.findAllByReservationIdOrderByPerformanceSeatIdAsc(reservationId)).isEmpty();
+        }
+
+        private AcceptedReservation expiredAttempt(AcceptedReservation accepted) {
+            jdbc.update("UPDATE ticket_reservations SET checkout_started_at = DATE_SUB(checkout_started_at, INTERVAL 10 MINUTE), payment_expires_at = DATE_SUB(payment_expires_at, INTERVAL 10 MINUTE), approval_started_at = DATE_SUB(approval_started_at, INTERVAL 10 MINUTE) WHERE id = ?", accepted.reservation().reservationId());
+            var context = new PaymentAttemptContext(accepted.attempt().paymentId(), instantColumn("approval_started_at", accepted.reservation().reservationId()));
+            return new AcceptedReservation(accepted.reservation(), checkout(accepted.reservation()), context);
+        }
+    }
+
+    @Nested
+    @DisplayName("결제 기한 만료")
+    class PaymentExpiration {
+        @ParameterizedTest(name = "{displayName} [최종 실패 이력={0}]")
+        @ValueSource(booleans = {false, true})
+        @DisplayName("미시도·최종 실패 예약은 기한 전 유지하고 동시 만료에서 주문·전체 좌석을 한 번만 반환한다")
+        void unprotectedPaymentExpiresOnce(boolean afterFailure) throws Exception {
+            var reservation = reserve();
+            var prepared = checkout(reservation);
+            if (afterFailure) {
+                var attempt = new PaymentAttemptContext(9001L, databaseNow());
+                assertThat(paymentTransaction(() -> paymentService.onApprovalStarting(reservation.reservationId(), attempt))).isEqualTo(ApprovalDecision.accept());
+                paymentTransaction(() -> { paymentService.onFailed(reservation.reservationId(), attempt); return null; });
+            }
+            assertThat(paymentService.expirePayment(reservation.reservationId())).isFalse();
+            assertThat(reservations.findExpiredPaymentIds()).doesNotContain(reservation.reservationId());
+            expireCheckoutFixture(reservation.reservationId());
+            var original = jdbc.queryForMap("SELECT order_id, checkout_started_at, payment_expires_at, current_payment_id, approval_started_at FROM ticket_reservations WHERE id = ?", reservation.reservationId());
+            assertThat(reservations.findExpiredPaymentIds()).contains(reservation.reservationId());
+            try (var pool = Executors.newFixedThreadPool(2)) {
+                var start = new CountDownLatch(1);
+                Callable<Boolean> action = () -> { await(start); return paymentService.expirePayment(reservation.reservationId()); };
+                var first = pool.submit(action);
+                var second = pool.submit(action);
+                start.countDown();
+                assertThat(List.of(first.get(15, TimeUnit.SECONDS), second.get(15, TimeUnit.SECONDS)))
+                        .containsExactlyInAnyOrder(true, false);
+            }
+            assertThat(paymentService.expirePayment(reservation.reservationId())).isFalse();
+            assertReleased(reservation);
+            assertThat(orders.find(prepared.orderId()).orElseThrow().status()).isEqualTo(OrderStatus.CANCELLED);
+            assertThat(jdbc.queryForMap("SELECT order_id, checkout_started_at, payment_expires_at, current_payment_id, approval_started_at FROM ticket_reservations WHERE id = ?", reservation.reservationId())).isEqualTo(original);
+            assertThat(reservations.findExpiredPaymentIds()).doesNotContain(reservation.reservationId());
+        }
+
+        @ParameterizedTest(name = "{displayName} [{0}]")
+        @ValueSource(strings = {"PROCESSING", "UNKNOWN", "RETRY"})
+        @DisplayName("기한이 지나도 진행·불명확·실패 후 새 시도는 후보 조회와 직접 만료 모두에서 보호한다")
+        void unresolvedAttemptIsProtected(String state) {
+            var accepted = acceptStart();
+            if (state.equals("UNKNOWN")) {
+                paymentTransaction(() -> { paymentService.onUnknown(accepted.reservation().reservationId(), accepted.attempt()); return null; });
+            } else if (state.equals("RETRY")) {
+                paymentTransaction(() -> { paymentService.onFailed(accepted.reservation().reservationId(), accepted.attempt()); return null; });
+                assertThat(paymentTransaction(() -> paymentService.onApprovalStarting(accepted.reservation().reservationId(),
+                        new PaymentAttemptContext(9002L, databaseNow())))).isEqualTo(ApprovalDecision.accept());
+            }
+            expireCheckoutFixture(accepted.reservation().reservationId());
+            var before = jdbc.queryForMap("SELECT status, current_payment_id, approval_started_at, payment_result_pending FROM ticket_reservations WHERE id = ?", accepted.reservation().reservationId());
+            assertThat(reservations.findExpiredPaymentIds()).doesNotContain(accepted.reservation().reservationId());
+            assertThat(paymentService.expirePayment(accepted.reservation().reservationId())).isFalse();
+            assertThat(jdbc.queryForMap("SELECT status, current_payment_id, approval_started_at, payment_result_pending FROM ticket_reservations WHERE id = ?", accepted.reservation().reservationId())).isEqualTo(before);
+            assertThat(orders.find(accepted.checkout().orderId()).orElseThrow().status()).isEqualTo(state.equals("UNKNOWN")
+                    ? OrderStatus.PAYMENT_REVIEW : OrderStatus.PAYMENT_CONFIRMING);
+            assertHeldSeats(accepted.reservation());
+        }
+
+        @ParameterizedTest(name = "{displayName} [승인 시작 선행={0}]")
+        @ValueSource(booleans = {true, false})
+        @DisplayName("승인 시작과 만료를 같은 잠금 순서로 직렬화하고 오래된 후보로 승인 시도를 반환하지 않는다")
+        void approvalAndExpirationSerialize(boolean approvalFirst) throws Exception {
+            var reservation = reserve();
+            var prepared = checkout(reservation);
+            Instant deadline = databaseNow().plusSeconds(3);
+            if (approvalFirst) {
+                jdbc.update("UPDATE ticket_reservations SET payment_expires_at = ? WHERE id = ?",
+                        LocalDateTime.ofInstant(deadline, ZoneOffset.UTC), reservation.reservationId());
+            } else {
+                expireCheckoutFixture(reservation.reservationId());
+            }
+            var attempt = new PaymentAttemptContext(9001L, databaseNow());
+            var winnerLocked = new CountDownLatch(1);
+            var allowCommit = new CountDownLatch(1);
+            var followerLocking = new CountDownLatch(1);
+            var firstInvocation = new AtomicBoolean(true);
+            doAnswer(invocation -> {
+                Object result = callOriginal(invocation);
+                if (firstInvocation.compareAndSet(true, false)) {
+                    entityManager.flush();
+                    winnerLocked.countDown();
+                    await(allowCommit);
+                }
+                return result;
+            }).when(orderTarget()).changeStatus(prepared.orderId(), approvalFirst ? OrderStatus.PAYMENT_CONFIRMING : OrderStatus.CANCELLED);
+            var pool = Executors.newFixedThreadPool(2);
+            try {
+                Callable<Object> approve = () -> paymentTransaction(() -> paymentService.onApprovalStarting(reservation.reservationId(), attempt));
+                Callable<Object> expire = () -> paymentService.expirePayment(reservation.reservationId());
+                var winner = pool.submit(approvalFirst ? approve : expire);
+                await(winnerLocked);
+                if (approvalFirst) {
+                    awaitDatabaseDeadline(deadline);
+                    // 수락 기록이 아직 커밋되지 않은 snapshot에서는 이 예약이 만료 후보로 보인다.
+                    assertThat(reservations.findExpiredPaymentIds()).contains(reservation.reservationId());
+                }
+                doAnswer(invocation -> { followerLocking.countDown(); return callOriginal(invocation); })
+                        .when(limits).findByUserIdAndPerformanceId(fixture.firstUserId(), fixture.performanceId());
+                var follower = pool.submit(approvalFirst ? expire : approve);
+                await(followerLocking);
+                allowCommit.countDown();
+                if (approvalFirst) {
+                    assertThat(winner.get(15, TimeUnit.SECONDS)).isEqualTo(ApprovalDecision.accept());
+                    assertThat(follower.get(15, TimeUnit.SECONDS)).isEqualTo(false);
+                    assertHeldSeats(reservation);
+                    assertThat(orders.find(prepared.orderId()).orElseThrow().status()).isEqualTo(OrderStatus.PAYMENT_CONFIRMING);
+                } else {
+                    assertThat(winner.get(15, TimeUnit.SECONDS)).isEqualTo(true);
+                    assertThat(((ApprovalDecision) follower.get(15, TimeUnit.SECONDS)).rejected()).isTrue();
+                    assertReleased(reservation);
+                }
+            } finally {
+                allowCommit.countDown();
+                pool.shutdownNow();
+                assertThat(pool.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
+            }
+        }
+
+        @Test
+        @DisplayName("주문 취소까지 flush한 뒤 실패하면 예약·좌석·수량도 롤백하고 새 트랜잭션에서 재처리한다")
+        void expirationRollsBackEntireReservation() {
+            var reservation = reserve();
+            var prepared = checkout(reservation);
+            expireCheckoutFixture(reservation.reservationId());
+            var failOnce = new AtomicBoolean(true);
+            doAnswer(invocation -> {
+                Object result = callOriginal(invocation);
+                if (failOnce.compareAndSet(true, false)) {
+                    entityManager.flush();
+                    assertReleased(reservation);
+                    assertThat(orders.find(prepared.orderId()).orElseThrow().status()).isEqualTo(OrderStatus.CANCELLED);
+                    throw new InjectedFailure();
+                }
+                return result;
+            }).when(orderTarget()).changeStatus(prepared.orderId(), OrderStatus.CANCELLED);
+            assertThatThrownBy(() -> paymentService.expirePayment(reservation.reservationId())).isInstanceOf(InjectedFailure.class);
+            assertThat(reservationStatus(reservation.reservationId())).isEqualTo("PAYMENT_PENDING");
+            assertThat(orders.find(prepared.orderId()).orElseThrow().status()).isEqualTo(OrderStatus.PENDING_PAYMENT);
+            assertHeldSeats(reservation);
+            assertThat(paymentService.expirePayment(reservation.reservationId())).isTrue();
+            assertReleased(reservation);
+        }
+
+        private void expireCheckoutFixture(Long reservationId) {
+            jdbc.update("UPDATE ticket_reservations SET checkout_started_at = DATE_SUB(checkout_started_at, INTERVAL 10 MINUTE), payment_expires_at = DATE_SUB(payment_expires_at, INTERVAL 10 MINUTE), approval_started_at = DATE_SUB(approval_started_at, INTERVAL 10 MINUTE) WHERE id = ?", reservationId);
+        }
+    }
+
+    private void awaitDatabaseDeadline(Instant deadline) throws InterruptedException {
+        long waitLimit = System.nanoTime() + TimeUnit.SECONDS.toNanos(8);
+        while (databaseNow().isBefore(deadline) && System.nanoTime() < waitLimit) {
+            TimeUnit.MILLISECONDS.sleep(10);
+        }
+        assertThat(databaseNow()).isAfterOrEqualTo(deadline);
     }
 
     private <T> T paymentTransaction(Supplier<T> action) {
