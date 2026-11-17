@@ -1,7 +1,7 @@
 # k6 시나리오
 
 [성능 실험 계획](../../docs/testing/performance.md)의 실험을 돌리는 k6 스크립트다. 입력 데이터는 [시드](../seed/README.md)가 만든다.
-드롭과 경매 시나리오를 둔다. 다른 도메인 시나리오는 각 담당자가 준비한다.
+드롭과 경매 시나리오를 둔다. 팬미팅은 [fanmeeting.md](fanmeeting.md)에 따로 둔다. 다른 도메인 시나리오는 각 담당자가 준비한다.
 
 | 파일 | 실험 | 내용 |
 |---|---|---|
@@ -9,6 +9,7 @@
 | [drop-reservation-step.js](drop-reservation-step.js) | EXP-01 용량 측정 | 도착률을 계단식으로 올려 무릎 지점과 최대 지속 처리량을 찾는다. 대기열 없음 |
 | [auction-bid-step.js](auction-bid-step.js) | AU-1·2·7 | 핫·분산·종료 직전 입찰 계단식 측정 |
 | [auction-close-report.sql](auction-close-report.sql) | AU-8 | 동시 종료 지연과 결과 집계 |
+| `fanmeeting-*` ([설명](fanmeeting.md)) | 팬미팅 S1, FM-EXP-05 | 오픈·마감 응모 몰림, 추첨, 결과 조회 폭주. `fanmeeting-s1.sh` 하나로 한 회 실행 |
 
 두 시나리오는 [lib/drop-reservation.js](lib/drop-reservation.js)의 호스트 안전장치, 요청, 결과 분류, 요약을 같이 쓴다. 다른 것은 부하 모델뿐이다.
 
