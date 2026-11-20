@@ -64,7 +64,7 @@ H·B·Q 시나리오는 [드롭 성능 실험 계획](../../docs/testing/drop-pe
 
 `POST /api/drops/{id}/reservations`만 친다. 대기열과 결제는 재지 않는다.
 
-- 대기열은 끈다. 입장 작업이 1초 간격으로 드롭마다 100명(`admit-per-run`)만 허가해서 대기열을 켜면 이 값이 처리량 상한이 된다. 그러면 재고 경합이 보이지 않는다. 대기열 효과는 EXP-02에서 잰다.
+- 대기열은 끈다. 입장 작업이 1초 간격으로 SKU마다 100명(`admit-per-run`)만 허가해서 대기열을 켜면 이 값이 처리량 상한이 된다. 그러면 재고 경합이 보이지 않는다. 대기열 효과는 EXP-02에서 잰다.
 - 부하 모델은 `ramping-arrival-rate`다. 도착률을 `RAMP` 동안 `PEAK_RATE`까지 올리고 `HOLD` 동안 유지한 뒤 5초에 걸쳐 내린다.
 - 반복마다 `users.csv`의 다른 행을 쓴다. 한 계정은 테스트에서 한 번만 요청한다. 경쟁률은 쓰는 행 수로 정한다. 참여자는 총재고 x `RATIO`다.
 - SKU는 계정 순서대로 돌아가며 고른다. 핫 드롭 SKU 3개의 재고가 거의 같아서 셋이 비슷한 시점에 품절된다.
@@ -218,6 +218,7 @@ k6 run perf/scenarios/drop-reservation-step.js
 
 회원 한 명이 iteration 하나다. off는 도착 즉시 재고를 점유한다. on은 대기 진입 뒤 `POLL_SECONDS`마다 상태를 조회하고 입장하면 점유한다. 점유에 성공하면 결제 준비와 승인까지 보낸다.
 앱의 `RESTLESS_DROP_QUEUE_REQUIRED`가 `QUEUE`와 같아야 한다. 시드는 sale이다. base로도 돌지만 워밍업이 없다.
+on은 회원마다 SKU 하나를 계정 순서대로 돌아가며 정하고 진입, 조회, 점유에 같은 SKU를 쓴다. off의 점유와 같은 배정이다. 입장 허가는 진입한 SKU의 점유에만 통한다.
 시드에 워밍업 드롭이 있으면 판매 전에 그 드롭으로 같은 흐름을 먼저 보낸다. 워밍업은 핫 드롭 재고와 참여 계정을 쓰지 않고 요약의 판매 결과에서 빠진다.
 
 | 변수 | 기본값 | 뜻 |
@@ -235,7 +236,8 @@ k6 run perf/scenarios/drop-reservation-step.js
 | `MAX_VUS`, `PRE_VUS` | on은 참여자 수, off는 3000 | on은 대기 중인 회원마다 VU 하나를 쓴다 |
 
 - 축소 조건은 시드 스케일과 `PEAK_RATE`를 함께 바꾼다. H-small은 `--scale sale_small`에 `PEAK_RATE=500`, H-mini는 `--scale sale_mini`에 `PEAK_RATE=200`이다.
-- 요약의 `member results`가 회원별 최종 결과다. `paid`, `sold_out`, `unfinished`, `queue_closed`, `admission_expired`, `payment_pending`, `payment_failed`, `error`로 나뉜다.
+- 요약의 `member results`가 회원별 최종 결과다. `paid`, `sold_out`, `unavailable`, `unfinished`, `queue_closed`, `admission_expired`, `payment_pending`, `payment_failed`, `error`로 나뉜다.
+- on의 `sold_out`에는 점유 품절과 진입 거절(그 SKU의 `available = 0`, 409 `DROP_SOLD_OUT`)이 함께 들어간다. `unavailable`은 대기 중 재고가 0이 되어 조회가 `UNAVAILABLE`을 받은 회원이다. 최종 매진은 아니다.
 - `first response`는 도착 뒤 첫 API의 평가 지연이다. `queue wait`는 진입 응답부터 입장을 확인한 시각까지다. `arrival to paid`는 도착부터 결제 승인까지다.
 - on에서 생성기가 참여자만큼 VU를 만들지 못하면 `dropped_iterations`가 생긴다. 그 실행은 원래 조건을 만들지 못한 것이다.
 
@@ -266,6 +268,7 @@ k6 run perf/scenarios/drop-reservation-step.js
 
 대기열을 켜고 입장 작업을 끈다(`RESTLESS_DROP_QUEUE_SCHEDULER_ENABLED=false`). 시드는 대기열을 미리 채우지 않는다.
 회원은 `ENTER_RATE`로 진입하고 진입하자마자 조회를 시작해 측정이 끝날 때까지 이어 간다. 구간은 fill, settle, warmup, measure 순서다.
+대기자는 계정 순서대로 핫 SKU에 나뉘어 진입한다. 입장 순번은 SKU마다 따로 센다. `drop_queue_waiting`은 SKU를 합친 인원이다.
 
 | 변수 | 기본값 | 뜻 |
 |---|---|---|
