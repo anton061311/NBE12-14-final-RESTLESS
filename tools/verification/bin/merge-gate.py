@@ -43,6 +43,31 @@ RECORD = re.compile(r"^\s*(?:[-*|]\s*)?판정 기록:\s*(PASS|FAIL|INCOMPLETE)\s
 NO_REVIEW = re.compile(r"독립 검증 없음:\s*\S")
 
 
+SCOPE_NOTICE = re.compile(r"^Backend test scope: (full|partial|none)\b(.*)$")
+
+
+def scope_from_annotations(messages):
+    """CI의 Select tests 단계가 남긴 notice에서 실제로 돌린 범위를 읽는다. 없으면 None."""
+    for m in messages:
+        hit = SCOPE_NOTICE.match(m.strip())
+        if hit:
+            return hit.group(1), hit.group(2).strip()
+    return None
+
+
+def ci_test_scope(check):
+    """backend 검사가 실제로 돌린 범위. 다시 계산하지 않고 그 실행의 annotation을 읽는다.
+    읽을 수 없으면 None이고, 그때 CI는 증거로 쓰지 않는다."""
+    job = re.search(r"/job/(\d+)", check.get("detailsUrl") or "")
+    if not job:
+        return None
+    r = subprocess.run(["gh", "api", f"repos/{{owner}}/{{repo}}/check-runs/{job.group(1)}/annotations",
+                        "--jq", ".[].message"], capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    return scope_from_annotations(r.stdout.splitlines())
+
+
 def gh(*args):
     r = subprocess.run(["gh", *args], capture_output=True, text=True)
     if r.returncode != 0:
@@ -137,12 +162,17 @@ def main():
     cfg = [f for f in files if match(f, BUILD_CONFIG)]
     backend = [c for c in pr["statusCheckRollup"] if c.get("name") == "backend"]
     ci_ok = bool(backend) and all(c.get("conclusion") == "SUCCESS" for c in backend)
+    scope = ci_test_scope(backend[-1]) if backend and ci_ok else None
     if cfg:
         print(f"CI 증거: 쓸 수 없음. 빌드나 CI 설정 변경 {cfg}. 검증자가 직접 build할 것")
     elif not backend:
         print("CI 증거: 쓸 수 없음. backend 검사 결과 없음")
+    elif ci_ok and scope is None:
+        print("CI 증거: 쓸 수 없음. CI가 돌린 테스트 범위를 읽지 못함. 검증자가 직접 build할 것")
+    elif ci_ok and scope[0] != "full":
+        print(f"CI 증거: 쓸 수 없음. CI 범위 {scope[0]} {scope[1]}. 검증자가 직접 build할 것")
     elif ci_ok:
-        print("CI 증거: 조건 1, 2 충족. 조건 3(artifact 테스트 수)은 review.md에서 확인할 것")
+        print("CI 증거: 조건 1, 2, 4 충족. 조건 3(artifact 테스트 수)은 review.md에서 확인할 것")
     else:
         print(f"CI 증거: 쓸 수 없음. backend {backend[-1].get('conclusion') or '진행 중'}")
     if kind != "format-doc" and backend and not ci_ok:
