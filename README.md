@@ -2,6 +2,7 @@
 
 팬덤 이벤트 커머스 FANQ(Spring Boot, MySQL)에서 **한정판 드롭, 주문, 결제**를 맡아, 부하 테스트로 병목을 하나씩 찾아 고친 프로젝트입니다.
 락 보유 시간 **9.64ms → 5.51ms**(포화 처리량 104 → 192건/초), 재고 행 분할로 처리량 **1.76배 이상**, CI **16분 → 6분 15초**.
+1만 명이 몰리는 판매에서 결제 완료 p95 **30.79초 → 7.67초**(−75%), 정합성 위반 0.
 
 > 모든 수치는 아래 [측정 조건](#측정-조건)에서 각 1회 측정한 값입니다.
 
@@ -11,7 +12,7 @@
 |---|---|---|
 | 드롭 구매 | 멱등 키를 받는 점유 API, 재고 예약 트랜잭션(TX1), 점유 만료 | [`DropReservationService`](backend/src/main/java/com/restless/drop/application/DropReservationService.java), [`DropReservationTransactions`](backend/src/main/java/com/restless/drop/application/DropReservationTransactions.java) |
 | 재고 버킷 | 한 상품의 재고를 K개 행으로 나누고 `FOR UPDATE SKIP LOCKED`로 빈 행을 고름 | [`DropInventoryRepository`](backend/src/main/java/com/restless/drop/infrastructure/DropInventoryRepository.java), [ADR-0005](docs/decisions/0005-drop-inventory-buckets.md) |
-| 입장 제어 | 대기열 진입, 입장 허가 작업, 조회 간격 안내, 동시 처리 상한 | [`DropQueueService`](backend/src/main/java/com/restless/drop/application/DropQueueService.java), [`DropQueueAdmissionJob`](backend/src/main/java/com/restless/drop/application/DropQueueAdmissionJob.java) |
+| 입장 제어 | 대기열 진입, 입장 허가 작업, 조회 간격 안내, 동시 처리 상한, Security 앞 거절 필터와 품절 표시 | [`DropQueueConcurrencyFilter`](https://github.com/prgrms-be-devcourse/NBE12-14-final-RESTLESS/blob/dev/backend/src/main/java/com/restless/drop/api/DropQueueConcurrencyFilter.java), [`DropSoldOutCache`](https://github.com/prgrms-be-devcourse/NBE12-14-final-RESTLESS/blob/dev/backend/src/main/java/com/restless/drop/application/DropSoldOutCache.java), [`DropQueueService`](backend/src/main/java/com/restless/drop/application/DropQueueService.java), [`DropQueueAdmissionJob`](backend/src/main/java/com/restless/drop/application/DropQueueAdmissionJob.java) |
 | 주문 | 공통 주문 생성 | [`OrderService`](backend/src/main/java/com/restless/order/application/OrderService.java) |
 | 결제 | 토스페이먼츠 연동, 트랜잭션 밖 PG 호출, 미완료 결제 재확인 작업 | [`PaymentService`](backend/src/main/java/com/restless/payment/application/PaymentService.java), [`PaymentReconciler`](backend/src/main/java/com/restless/payment/application/PaymentReconciler.java), [ADR-0003](docs/decisions/0003-payment-module-boundary.md) |
 | 부하 테스트 | k6 시나리오, 시드 데이터, EC2 측정 도구 | [`perf/`](perf/README.md) |
@@ -32,6 +33,15 @@ flowchart LR
     A[1. 재고 행 락<br>104건/초] -->|락 구간 축소| B[2. 같은 행 커밋 줄서기<br>159건/초]
     B -->|재고 행 분할| C[3. 앱 CPU<br>약 345건/초]
     C -->|설정 조정 시도| D[효과 없음<br>한계로 기록]
+```
+
+판매 시나리오(1만 명, 최대 1,000명/초)로 옮긴 뒤 같은 방식을 이어 갔습니다.
+
+```mermaid
+flowchart LR
+    E[4. 결제하기 흐름 회귀<br>PAID p95 30.79초] -->|조회를 409 뒤로| F[5. 거절 요청의 앱 CPU<br>13.04초]
+    F -->|Security 앞 필터| G[6. DB 커밋과 핫 행 잠금<br>7.67초]
+    G -->|버킷 16, 풀 30 시도| H[판매 속도 그대로<br>다음 과제]
 ```
 
 ### 1. 재고 행 하나에 요청이 줄을 서서 104건/초에서 멈춤
@@ -114,6 +124,64 @@ flowchart LR
 
 - **배운 점**: JFR 표본은 커널, GC, JIT 시간을 빼고 셉니다. 그래서 표본 비율이 크게 줄어도 실제 CPU는 거의 줄지 않았습니다. 이후 CPU 개선은 누적 `process_cpu_time_ns_total`로 **요청당 CPU 시간**을 비교합니다.
 
+### 4. 결제하기 버튼 하나로 결제 완료 p95가 9초대에서 30초대로
+
+- **문제**: 구매 화면을 결제하기 한 번으로 대기열부터 결제창까지 잇도록 바꾸자, 같은 판매 조건에서 결제 완료(PAID) p95가 8.6~9.4초에서 28.2~30.8초로 나빠졌습니다. 결제하기 직후 1,949~3,164명이 진입도 못 하고 막혔습니다.
+- **원인 확인**: 용의자는 진입 전에 새로 생긴 주문 목록 조회 1만 건과, 측정하며 바뀐 입장 설정 두 가지였습니다. 한 번에 하나만 바꿔 네 조건을 쟀습니다.
+
+| 조건 | 입장 설정 | 주문 목록 조회 | PAID p95 | 판매 HTTP | 결과 |
+|---|---|---|---:|---:|---|
+| A | 1대, SKU당 47명 | 켬 | 28.20초 | 59,316 | 1,949명 조회 timeout |
+| B | 1대, SKU당 47명 | 끔 | 52.26초 | 106,608 | 중단 기준 도달 |
+| C | 2대, SKU당 100명 | 켬 | 30.79초 | 54,206 | 3,164명 조회 timeout |
+| **D** | 2대, SKU당 100명 | 끔 | **13.04초** | **39,242** | 완주 |
+
+- **직관과 반대인 결과**: B에서 조회를 빼자 더 나빠졌습니다. 조회가 대기열 앞에서 유입을 667명/초로 늦추는 조절 장치 역할을 하고 있었고, 빠지자 입장이 느린 상태에서 polling이 69,991건으로 늘어 앱 CPU를 채웠습니다. 뒤에 부하 발생기 노트북의 임시 포트 고갈도 섞였음을 찾아, 측정 전 포트 범위를 검사하는 단계를 추가했습니다 ([#465](https://github.com/prgrms-be-devcourse/NBE12-14-final-RESTLESS/pull/465)).
+- **선택**: 그 조회가 막으려던 것은 결제 대기 주문이 있는 회원이 다시 누르는 소수의 경우였습니다. 같은 회원의 중복 구매는 서버의 재고 점유 트랜잭션이 이미 409로 막으므로, 화면 조회는 정합성 장치가 아니라 편의 장치였습니다. 그래서 **409를 받았을 때만 조회**하도록 정책과 화면을 바꿨습니다 ([#454](https://github.com/prgrms-be-devcourse/NBE12-14-final-RESTLESS/pull/454)). 대가는 해당 회원이 대기를 한 번 더 거치는 것입니다.
+- **검증** (C 대비 D, 조회 하나만 다름)
+
+| 항목 | 변경 전 (C) | 변경 후 (D) |
+|---|---:|---:|
+| 참가 시작 → PAID p95 | 30.79초 | 13.04초 (−57.6%) |
+| 판매 HTTP 요청 | 54,206 | 39,242 (−27.6%) |
+| polling 요청 | 15,761 | 3,163 (−79.9%) |
+| 조회 timeout으로 막힌 사용자 | 3,164 | 0 |
+| 정합성 위반 | 0 | 0 |
+
+비교한 지표 20개 중 15개 개선, 2개 유지, 3개 미개선이었습니다. 미개선은 앱 CPU, Tomcat 스레드, 진입 503 수로, 판매 첫 10초의 포화가 그대로라는 뜻이었고 이것이 다음 단계로 이어졌습니다.
+
+### 5. 거절 한 건이 정상 조회만큼 비쌌음: Security 앞에서 거절
+
+- **문제**: D에서도 판매 첫 20초 앱 CPU가 0.88~0.97로 포화였고, 진입 요청의 69%가 대기열 혼잡 503이었습니다.
+- **원인 확인**: 거절 요청만 따로 보내 요청당 CPU를 쟀습니다. 품절 409 한 건이 2.35ms로, DB 조회를 포함한 인증 GET 2.40ms와 같았습니다. 거절 비용 대부분이 판정이 아니라 JWT, Spring Security, MVC, 예외 처리 같은 공통 경로였고, 판매 첫 20초 앱 CPU의 35~43%가 거절에 쓰였습니다. JFR 측정은 오버헤드를 낮춘 기본 설정으로 EC2에 상시 적용했습니다 ([#456](https://github.com/prgrms-be-devcourse/NBE12-14-final-RESTLESS/pull/456), [#465](https://github.com/prgrms-be-devcourse/NBE12-14-final-RESTLESS/pull/465)).
+- **선택**: 두 번에 나눠 하나씩 바꿨습니다.
+  1. 대기열 503 판정을 Spring Security 앞 서블릿 필터로 옮기고, 응답 본문은 미리 만든 바이트로 씁니다 ([#478](https://github.com/prgrms-be-devcourse/NBE12-14-final-RESTLESS/pull/478)).
+  2. 다시 JFR로 보니 다음 몫은 품절 뒤 들어온 약 8,700명의 409(CPU 약 27%)였습니다. 판매 중 모든 SKU가 품절인 드롭은 같은 필터에서 바로 409를 돌려줍니다. 품절 표시는 서버별로 1초만 유지하고, 만료 뒤 재확인 쿼리는 한 요청만 보냅니다 ([#482](https://github.com/prgrms-be-devcourse/NBE12-14-final-RESTLESS/pull/482)).
+- **검증 중 잡은 결함**: 독립 검증에서 인코딩된 경로로 필터를 우회하는 경우(#478)와 판매가 끝난 뒤에도 품절 409가 남는 경우(#482)를 찾아 머지 전에 고쳤습니다.
+
+| 항목 | D 기준 | E (503 필터) | F (+ 품절 409 필터) |
+|---|---:|---:|---:|
+| 첫 응답 p99 | 5.00초 | 1.86초 | 1.52초 (−70%) |
+| 재고 점유 p95 | 2.43초 | 1.41초 | 1.04초 (−57%) |
+| 참가 시작 → PAID p95 | 13.04초 | 7.97초 | 7.67초 (−41%) |
+| 첫 20초 앱 CPU (s1 / s2) | 0.88 / 0.97 | 0.80 / 0.76 | 0.51 / 0.50 |
+| 진입 503 | 22,899 | 12,613 | 9,750 (−57%) |
+| 정합성 위반 | 0 | 0 | 0 |
+
+앱 서버를 늘리지 않고 같은 두 대에서 얻은 결과입니다.
+
+### 6. 앱을 4대로 늘리자 병목이 DB로 넘어감: 효과 없어 채택하지 않은 두 시도
+
+- **문제**: 앱 CPU 여유를 확인하려고 같은 이미지로 서버 두 대를 더 만들어 ALB에 붙였습니다(G). 앱 CPU는 0.38~0.45로 내려갔지만 PAID p95는 7.93초로 그대로였습니다.
+- **원인 확인**: 모든 서버에서 Hikari 커넥션 20개가 소진됐고, 재고 버킷 행 잠금 대기가 6.2배, COMMIT 대기가 늘었습니다. RDS CPU와 IOPS는 여유가 있었습니다.
+
+| 시도 | 결과 | 판정 |
+|---|---|---|
+| 재고 버킷 4 → 16 (H) | 잠금 대기 −77%, 점유 p95 0.79초. 판매 속도 초당 약 100개와 COMMIT 대기는 그대로, PAID p95 8.73초 | 원인이 버킷 경합만은 아님을 확인 |
+| Hikari 20 → 30 (I) | 첫 응답 p99 1.88초, 점유 p95 1.37초로 악화 | 채택하지 않음 |
+
+- **배운 점**: 동시 트랜잭션을 늘리면 DB 안에서 기다리는 시간만 길어졌습니다. 전체 80개 근처가 이미 한계로 보이며, 다음 과제는 결제 확정 경로에서 트랜잭션이 잠금을 쥐는 시간을 줄이는 것입니다.
+
 ### 측정 조건
 
 | 항목 | 값 |
@@ -124,6 +192,7 @@ flowchart LR
 | PG | 가짜 PG, 응답 300ms |
 | 시나리오 | 1번은 인기 상품 1개, 2번과 3번은 같은 조건에서 버킷 수만 바꿈 |
 | 횟수 | 조건마다 1회. 측정일은 2026-11-20 ~ 11-23 |
+| 4~6번 | 판매 시나리오: 워밍업 1,800명 뒤 1만 명, 최대 1,000명/초, 재고 1,000개(SKU 3개). ALB 뒤 t3.small 2대(6번 G 이후 4대), RDS db.t4g.small, 대기열 켬, 가짜 PG 300ms. 측정일 2026-11-25 ~ 11-26 |
 
 원본 측정 데이터는 공개하지 않습니다. 측정 계획과 규약은 [drop-performance-plan](docs/testing/drop-performance-plan.md), [측정 규약](docs/testing/drop-performance-measurement.md)에 있습니다.
 
@@ -145,7 +214,10 @@ flowchart LR
 | K=1과 K=4를 다른 날 측정. K=1은 측정 뒤 불변식 확인 누락 | 같은 날 번갈아 측정 |
 | 버킷당 락 시간이 6.39 → 8.26 → 약 10ms로 늘어난 원인 미확인 | 커밋 구간 타이머로 부하별 분해 |
 | 매분 정각에 0.1~0.8초 응답 정체가 모든 측정에 섞임. 권한 부족으로 원인 미확정 | RDS 지표 권한 확보 후 재조사 |
-| EC2 사양을 키우지 않고 t3.small 한 대로만 측정, DB도 한 대 | 서버를 늘린 측정은 대기열 작업과 함께 정리 예정 |
+| 1,000명/초 단계 목표 중 PAID p95 20초만 통과. 첫 응답 p99 1.5초(목표 1초), 재고 점유 p95 0.79~1.04초(목표 300ms) 미달 | 결제 확정 경로의 잠금 시간 분석 후 2,000, 5,000명/초 단계로 진행 |
+| 거절 비용 35~43%는 서버당 약 250건/초에서 잰 단가를 포화 구간에 옮긴 추정이라 위쪽으로 치우칠 수 있음 | JFR 표본으로 교차 확인했고, 결론은 하한 35% 기준으로 씀 |
+| 지연은 HTTP timeout 5초, 10초에서 잘리고 PAID 분위수는 PAID 도달자만의 분포 | timeout을 늘린 회차로 꼬리 확인 |
+| DB가 한 대이고 앱만 최대 4대로 늘림 | DB 쪽 병목은 쿼리와 트랜잭션 구조로 먼저 줄임 |
 | 가짜 PG 300ms 기준의 합성 처리량이라 실제 구매 완료 처리량과 다름 | 실제 PG에는 부하 테스트를 하지 않는 것이 원칙. 결과 해석에만 반영 |
 
 ## 📋 프로젝트 정보
@@ -160,7 +232,7 @@ flowchart LR
 
 | 이름 | 담당 | 주요 작업 |
 |---|---|---|
-| **이태호 (본인)** | **한정판 드롭, 주문, 결제, 배포, CI/CD, 부하 테스트 환경** | **재고 예약, 입장 대기열, 재고 행 분할, 미완료 결제 재확인** |
+| **이태호 (본인)** | **한정판 드롭, 주문, 결제, 배포, CI/CD, 부하 테스트 환경** | **재고 예약, 입장 대기열, 재고 행 분할, 거절 경로 필터, 미완료 결제 재확인** |
 | 송혜민 | 티켓팅, 공연, 공연장 | 좌석 선점, 티켓 발급, 티켓 환불, 좌석 조회 성능 개선 |
 | 천종원 | 경매, 크레딧 | 경매 등록과 입찰, SSE 실시간 상태, 크레딧 충전 |
 | 홍승연 | 팬미팅 추첨, 인증, 회원 | JWT 인증, 응모, 추첨, 예비 승격 |
